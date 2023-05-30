@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useEffect, useRef } from "react";
 import { EventEmitter } from "../../utils/EventEmitter";
 import { RunningScript } from "../../Script/RunningScript";
 import { killWorkerScriptByPid } from "../../Netscript/killWorkerScript";
@@ -38,6 +38,7 @@ export class LogBoxProperties {
   y = window.innerHeight * 0.3;
   width = 500;
   height = 500;
+  minimized = false;
 
   rerender: () => void;
   rootRef: React.RefObject<Draggable>;
@@ -63,8 +64,14 @@ export class LogBoxProperties {
   setSize(width: number, height: number): void {
     this.width = width;
     this.height = height;
-    this.rerender();
+    this.updateDOM();
   }
+
+  // using arrow function to autobind
+  toggleMinimize = () => {
+    this.minimized = !this.minimized;
+    this.rerender();
+  };
 
   isVisible(): boolean {
     return this.rootRef.current !== null;
@@ -130,11 +137,6 @@ export function LogBoxManager(): React.ReactElement {
   );
 }
 
-interface IProps {
-  script: RunningScript;
-  onClose: () => void;
-}
-
 const useStyles = makeStyles(() =>
   createStyles({
     logs: {
@@ -158,17 +160,52 @@ const useStyles = makeStyles(() =>
 
 export const logBoxBaseZIndex = 1500;
 
+class LogBoxPropertiesRegistry {
+  private static cache = new Map<number, LogBoxProperties>();
+
+  static get(pid: number) {
+    return this.cache.get(pid);
+  }
+
+  static register(pid: number, rootRef: React.RefObject<Draggable>, rerender: () => void) {
+    if (this.get(pid)) {
+      throw new Error(`This log window is already registered, pid: ${pid}`);
+    }
+
+    const properties = new LogBoxProperties(rerender, rootRef);
+    this.cache.set(pid, properties);
+
+    return properties;
+  }
+
+  static unregister(pid: number) {
+    if (!this.cache.delete(pid)) {
+      throw new Error(`Log window is not registered, pid: ${pid}`);
+    }
+  }
+}
+
+interface IProps {
+  script: RunningScript;
+  onClose: () => void;
+}
+
 function LogWindow(props: IProps): React.ReactElement {
+  const classes = useStyles();
+
+  const rerender = useRerender(1000);
+
   const draggableRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<Draggable>(null);
-  const script = props.script;
-  const classes = useStyles();
   const container = useRef<HTMLDivElement>(null);
   const textArea = useRef<HTMLDivElement>(null);
-  const rerender = useRerender(1000);
-  const propsRef = useRef(new LogBoxProperties(rerender, rootRef));
-  script.tailProps = propsRef.current;
-  const [minimized, setMinimized] = useState(false);
+
+  const logBoxProperties =
+    LogBoxPropertiesRegistry.get(props.script.pid) ||
+    LogBoxPropertiesRegistry.register(props.script.pid, rootRef, rerender);
+
+  const script = props.script;
+  script.tailProps = logBoxProperties;
 
   const textAreaKeyDown = (e: React.KeyboardEvent) => {
     if (e.ctrlKey && e.key === "a") {
@@ -183,12 +220,12 @@ function LogWindow(props: IProps): React.ReactElement {
     }
   };
 
-  const onResize = (e: React.SyntheticEvent, { size }: ResizeCallbackData) => {
-    propsRef.current.setSize(size.width, size.height);
+  const onResize = (_e: React.SyntheticEvent, { size }: ResizeCallbackData) => {
+    logBoxProperties.setSize(size.width, size.height);
   };
 
   useEffect(() => {
-    propsRef.current.updateDOM();
+    logBoxProperties.updateDOM();
     updateLayer();
   }, []);
 
@@ -247,10 +284,6 @@ function LogWindow(props: IProps): React.ReactElement {
     );
   }
 
-  function minimize(): void {
-    setMinimized(!minimized);
-  }
-
   function lineColor(s: string): "error" | "success" | "warn" | "info" | "primary" {
     if (s.match(/(^\[[^\]]+\] )?ERROR/) || s.match(/(^\[[^\]]+\] )?FAIL/)) {
       return "error";
@@ -280,9 +313,15 @@ function LogWindow(props: IProps): React.ReactElement {
     if (!node) return;
 
     if (!isOnScreen(node)) {
-      propsRef.current.setPosition(0, 0);
+      logBoxProperties.setPosition(0, 0);
+      logBoxProperties.updateDOM();
     }
   }, 100);
+
+  const onClose = () => {
+    LogBoxPropertiesRegistry.unregister(script.pid);
+    props.onClose();
+  };
 
   const isOnScreen = (node: HTMLDivElement): boolean => {
     const bounds = node.getBoundingClientRect();
@@ -290,19 +329,31 @@ function LogWindow(props: IProps): React.ReactElement {
     return !(bounds.right < 0 || bounds.bottom < 0 || bounds.left > innerWidth || bounds.top > outerWidth);
   };
 
-  const boundToBody = (e: DraggableEvent): void | false => {
-    if (
-      e instanceof MouseEvent &&
-      (e.clientX < 0 || e.clientY < 0 || e.clientX > innerWidth || e.clientY > innerHeight)
-    )
-      return false;
+  const onDrag = (e: DraggableEvent): void | false => {
+    if (e instanceof MouseEvent) {
+      // bind to outer container
+      if (e.clientX < 0 || e.clientY < 0 || e.clientX > innerWidth || e.clientY > innerHeight) {
+        return false;
+      }
+
+      logBoxProperties.setPosition(e.clientX - e.offsetX, e.clientY - e.offsetY);
+    }
   };
 
-  // Max [width, height]
-  const minConstraints: [number, number] = [150, 33];
+  const minConstraints: [width: number, height: number] = [150, 33];
+
+  const { x, y, width, height, minimized, toggleMinimize } = logBoxProperties;
+
+  const defaultPosition = useRef({ x, y });
 
   return (
-    <Draggable handle=".drag" onDrag={boundToBody} ref={rootRef} onMouseDown={updateLayer}>
+    <Draggable
+      handle=".drag"
+      onDrag={onDrag}
+      ref={rootRef}
+      onMouseDown={updateLayer}
+      defaultPosition={defaultPosition.current}
+    >
       <Box
         display="flex"
         sx={{
@@ -325,8 +376,8 @@ function LogWindow(props: IProps): React.ReactElement {
         ref={container}
       >
         <ResizableBox
-          width={propsRef.current.width}
-          height={propsRef.current.height}
+          width={width}
+          height={height}
           onResize={onResize}
           minConstraints={minConstraints}
           handle={
@@ -357,10 +408,10 @@ function LogWindow(props: IProps): React.ReactElement {
                     <StopCircleIcon color="error" />
                   </IconButton>
                 )}
-                <IconButton className={classes.titleButton} onClick={minimize} onTouchEnd={minimize}>
+                <IconButton className={classes.titleButton} onClick={toggleMinimize} onTouchEnd={toggleMinimize}>
                   {minimized ? <ExpandMoreIcon /> : <ExpandLessIcon />}
                 </IconButton>
-                <IconButton className={classes.titleButton} onClick={props.onClose} onTouchEnd={props.onClose}>
+                <IconButton className={classes.titleButton} onClick={onClose} onTouchEnd={onClose}>
                   <CloseIcon />
                 </IconButton>
               </span>
